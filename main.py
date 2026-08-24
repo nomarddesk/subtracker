@@ -308,10 +308,31 @@ def kb_main(state: str) -> InlineKeyboardMarkup:
         rows.append(
             [InlineKeyboardButton(text="🔁 Extend subscription", callback_data="sub")]
         )
-    rows.append(
-        [InlineKeyboardButton(text="💬 Support", url=f"https://t.me/{SUPPORT_USERNAME}")]
-    )
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_member(first_name: str | None, username: str | None, uid: int) -> InlineKeyboardMarkup:
+    """
+    Button that takes the channel owner straight to the new subscriber.
+
+    A bot cannot open a chat on someone's behalf, so this is a deep link the
+    owner taps themselves:
+      - has a @username -> t.me link, opens the chat ready to type
+      - no @username    -> tg://user?id=, opens their profile if their privacy
+                           settings allow it (Telegram may show nothing if they
+                           have locked that down, which is not something any bot
+                           can work around)
+    """
+    name = (first_name or "").strip()
+    if len(name) > 16:
+        name = name[:16] + "…"
+    if username:
+        label = f"💬 Message {name}" if name else "💬 Message them"
+        btn = InlineKeyboardButton(text=label, url=f"https://t.me/{username}")
+    else:
+        label = f"👤 Open {name}'s profile" if name else "👤 Open profile"
+        btn = InlineKeyboardButton(text=label, url=f"tg://user?id={uid}")
+    return InlineKeyboardMarkup(inline_keyboard=[[btn]])
 
 
 def kb_chains() -> InlineKeyboardMarkup:
@@ -1254,7 +1275,12 @@ async def on_member_change(ev: ChatMemberUpdated):
         f"<code>{who.id}</code>\n\n"
         f"<i>Today: ↗️ {today['j']} · ↘️ {today['l']}</i>"
     )
-    if await dm(owner_id, text):
+
+    # Only joins get the reach-out button. Chasing someone who just left reads
+    # as desperate and rarely wins them back.
+    markup = kb_member(who.first_name, who.username, who.id) if action == "join" else None
+
+    if await dm(owner_id, text, markup):
         async with pool.acquire() as con:
             await con.execute(
                 "UPDATE events SET delivered = TRUE WHERE id = $1", event_id
