@@ -89,6 +89,26 @@ FUZZY_TOL = {"ton": Decimal("0.05"), "trc20": Decimal("1.00")}
 ORPHAN_WINDOW = 6 * 3600
 
 POLL_SECONDS = 30
+
+# --- burst suppression -------------------------------------------------------
+# Telegram allows roughly one message per second per chat. A 5,000-join hour
+# would flood-limit the bot and silence it exactly when it matters most, so
+# above this rate we stop sending one alert per person and switch to rollups.
+BURST_WINDOW_MIN = int(os.environ.get("BURST_WINDOW_MIN", "5"))
+BURST_THRESHOLD = int(os.environ.get("BURST_THRESHOLD", "20"))
+
+# --- bot-traffic detection ---------------------------------------------------
+FRAUD_WINDOW_MIN = int(os.environ.get("FRAUD_WINDOW_MIN", "60"))
+FRAUD_MIN_JOINS = int(os.environ.get("FRAUD_MIN_JOINS", "25"))   # never fire below this
+FRAUD_VELOCITY_X = float(os.environ.get("FRAUD_VELOCITY_X", "8"))  # x normal hourly rate
+FRAUD_BOUNCE_RATE = float(os.environ.get("FRAUD_BOUNCE_RATE", "0.35"))
+FRAUD_NOUSER_RATE = float(os.environ.get("FRAUD_NOUSER_RATE", "0.80"))
+FRAUD_CLUSTER_RATE = float(os.environ.get("FRAUD_CLUSTER_RATE", "0.40"))
+# Telegram user IDs rise over time, so accounts registered together sit close
+# together numerically. This is the width of the ID window we treat as "one
+# registration batch" — about a few days of global Telegram signups.
+FRAUD_BATCH_SPAN = int(os.environ.get("FRAUD_BATCH_SPAN", "50000000"))
+FRAUD_COOLDOWN_H = int(os.environ.get("FRAUD_COOLDOWN_H", "6"))
 COUNTDOWN_SECONDS = 60
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -152,6 +172,14 @@ CREATE TABLE IF NOT EXISTS invoices (
     paid_at      TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS invoices_open_idx ON invoices (status, chain);
+
+CREATE TABLE IF NOT EXISTS alerts (
+    id       BIGSERIAL PRIMARY KEY,
+    chat_id  BIGINT NOT NULL,
+    kind     TEXT NOT NULL,
+    at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS alerts_chat_idx ON alerts (chat_id, kind, at DESC);
 
 CREATE TABLE IF NOT EXISTS seen_tx (
     tx_hash   TEXT PRIMARY KEY,
@@ -914,6 +942,39 @@ async def cmd_today(m: Message):
     await m.answer(text or "Nothing in the last 24 hours.")
 
 
+@dp.message(Command("fraud"))
+async def cmd_fraud(m: Message):
+    if not await has_access(m.from_user.id):
+        await m.answer(
+            "⌛ Traffic checks are part of the subscription.", reply_markup=kb_sub_only()
+        )
+        return
+    async with pool.acquire() as con:
+        chans = await con.fetch(
+            "SELECT * FROM channels WHERE owner_id = $1 AND active", m.from_user.id
+        )
+    if not chans:
+        await m.answer("No channels to check yet.")
+        return
+    for c in chans:
+        a = await analyse_burst(c["chat_id"])
+        if a is None:
+            await m.answer(
+                f"✅ <b>{esc(c['title'])}</b>\n"
+                f"Nothing unusual in the last {FRAUD_WINDOW_MIN} minutes. "
+                f"Too few joins to judge, which is normal."
+            )
+        elif a["level"] == "info":
+            await m.answer(
+                f"✅ <b>{esc(c['title'])}</b>\n"
+                f"{a['n']} joins in the last {FRAUD_WINDOW_MIN} minutes and they look "
+                f"human — {a['bounced']:.0%} bounced, {a['nouser']:.0%} without a "
+                f"@username. Busy, not fake."
+            )
+        else:
+            await m.answer(fraud_message(c["title"], a))
+
+
 @dp.message(Command("subscribe"))
 async def cmd_subscribe(m: Message):
     await ensure_user(m.from_user.id, m.from_user.username, m.from_user.first_name)
@@ -1257,6 +1318,19 @@ async def on_member_change(ev: ChatMemberUpdated):
     if not await has_access(owner_id):
         return
 
+    # Burst guard. Past a certain rate, one DM per person would flood-limit the
+    # bot and drown the owner. Above the threshold we go quiet here and let the
+    # rollup job send a single grouped message instead.
+    async with pool.acquire() as con:
+        recent = await con.fetchval(
+            "SELECT COUNT(*) FROM events WHERE chat_id = $1 AND action = 'join' "
+            "AND at > now() - ($2 || ' minutes')::interval",
+            ev.chat.id,
+            str(BURST_WINDOW_MIN),
+        )
+    if recent > BURST_THRESHOLD:
+        return
+
     icon = "🟢" if action == "join" else "🔴"
     verb = "joined" if action == "join" else "left"
     async with pool.acquire() as con:
@@ -1342,6 +1416,237 @@ async def build_digest(uid: int, hours: int = 24) -> str:
         out.append(CHURN_NOTE)
 
     return "\n".join(out)
+
+
+async def note_alert(chat_id: int, kind: str) -> None:
+    async with pool.acquire() as con:
+        await con.execute(
+            "INSERT INTO alerts (chat_id, kind) VALUES ($1, $2)", chat_id, kind
+        )
+
+
+async def alerted_recently(chat_id: int, kind: str, hours: int) -> bool:
+    async with pool.acquire() as con:
+        return bool(
+            await con.fetchval(
+                "SELECT 1 FROM alerts WHERE chat_id = $1 AND kind = $2 "
+                "AND at > now() - ($3 || ' hours')::interval LIMIT 1",
+                chat_id,
+                kind,
+                str(hours),
+            )
+        )
+
+
+async def burst_rollup_job() -> None:
+    """
+    While a channel is in burst mode the per-person alerts are suppressed, so
+    this sends one grouped message per window instead. One message per channel
+    per window, no matter whether 50 or 5,000 people arrived.
+    """
+    while True:
+        try:
+            async with pool.acquire() as con:
+                rows = await con.fetch(
+                    """
+                    SELECT e.chat_id, c.owner_id, c.title, COUNT(*) AS n
+                      FROM events e JOIN channels c ON c.chat_id = e.chat_id
+                     WHERE e.action = 'join' AND c.active
+                       AND e.at > now() - ($1 || ' minutes')::interval
+                     GROUP BY e.chat_id, c.owner_id, c.title
+                    HAVING COUNT(*) > $2
+                    """,
+                    str(BURST_WINDOW_MIN),
+                    BURST_THRESHOLD,
+                )
+            for r in rows:
+                if not await has_access(r["owner_id"]):
+                    continue
+                if await alerted_recently(r["chat_id"], "rollup", 0):
+                    continue
+                async with pool.acquire() as con:
+                    left = await con.fetchval(
+                        "SELECT COUNT(*) FROM events WHERE chat_id = $1 "
+                        "AND action = 'leave' AND at > now() - ($2 || ' minutes')::interval",
+                        r["chat_id"],
+                        str(BURST_WINDOW_MIN),
+                    )
+                await note_alert(r["chat_id"], "rollup")
+                await dm(
+                    r["owner_id"],
+                    f"⚡️ <b>{r['n']} joined</b> · {esc(r['title'])}\n"
+                    f"<i>last {BURST_WINDOW_MIN} minutes · {left} left in the same window</i>\n\n"
+                    "Too many to alert one by one, so I've grouped them. "
+                    "Use /today for the full list.",
+                )
+        except Exception as e:
+            log.exception("rollup job error: %s", e)
+        await asyncio.sleep(BURST_WINDOW_MIN * 60)
+
+
+def batch_fraction(ids: list[int]) -> float:
+    """
+    Largest share of these accounts that were registered in one batch.
+
+    Telegram issues user IDs in ascending order over time, so accounts created
+    together sit in a narrow numeric band. This slides a fixed-width window over
+    the sorted IDs and returns the densest share it finds.
+
+    Measuring density rather than the gaps between neighbours is deliberate. Gap
+    distance shrinks as a crowd grows, so a gap-based test reports near 100% on
+    any large burst including a genuine viral one. Density is scale-free: real
+    signups are spread across the whole ID space, so the densest window holds
+    roughly span_width/total_id_space of them — about half a percent — whether
+    200 people turn up or 8,000.
+    """
+    n = len(ids)
+    if n < 8:
+        return 0.0
+    ids = sorted(ids)
+    best = 1
+    j = 0
+    for i in range(n):
+        while ids[i] - ids[j] > FRAUD_BATCH_SPAN:
+            j += 1
+        best = max(best, i - j + 1)
+    return best / n
+
+
+async def analyse_burst(chat_id: int, minutes: int = FRAUD_WINDOW_MIN) -> dict | None:
+    """Score a window of joins for signs of paid bot traffic."""
+    async with pool.acquire() as con:
+        joins = await con.fetch(
+            """
+            SELECT DISTINCT ON (e.member_id)
+                   e.member_id, e.username, e.at,
+                   EXISTS (
+                     SELECT 1 FROM events l
+                      WHERE l.chat_id = e.chat_id AND l.member_id = e.member_id
+                        AND l.action = 'leave' AND l.at >= e.at
+                   ) AS bounced
+              FROM events e
+             WHERE e.chat_id = $1 AND e.action = 'join'
+               AND e.at > now() - ($2 || ' minutes')::interval
+             ORDER BY e.member_id, e.at DESC
+            """,
+            chat_id,
+            str(minutes),
+        )
+        baseline = await con.fetchval(
+            """
+            SELECT COUNT(*)::float
+                 / GREATEST(EXTRACT(EPOCH FROM (now() - MIN(at))) / 3600.0, 1.0)
+              FROM events
+             WHERE chat_id = $1 AND action = 'join'
+               AND at < now() - ($2 || ' minutes')::interval
+               AND at > now() - interval '7 days'
+            """,
+            chat_id,
+            str(minutes),
+        ) or 0.0
+
+    n = len(joins)
+    if n < FRAUD_MIN_JOINS:
+        return None
+
+    per_hour = n * (60.0 / minutes)
+    bounced = sum(1 for r in joins if r["bounced"]) / n
+    nouser = sum(1 for r in joins if not r["username"]) / n
+    cluster = batch_fraction([r["member_id"] for r in joins])
+
+    # Velocity is the gate, never the verdict. A campaign that simply works also
+    # spikes; only the quality signals separate real growth from a bot farm.
+    if per_hour < max(FRAUD_MIN_JOINS, baseline * FRAUD_VELOCITY_X):
+        return None
+
+    flags = []
+    if bounced >= FRAUD_BOUNCE_RATE:
+        flags.append(f"{bounced:.0%} joined and left again straight away")
+    if nouser >= FRAUD_NOUSER_RATE:
+        flags.append(f"{nouser:.0%} have no @username")
+    if cluster >= FRAUD_CLUSTER_RATE:
+        flags.append(f"{cluster:.0%} were registered in the same batch")
+
+    return {
+        "n": n,
+        "per_hour": per_hour,
+        "baseline": baseline,
+        "bounced": bounced,
+        "nouser": nouser,
+        "cluster": cluster,
+        "flags": flags,
+        "level": "high" if len(flags) >= 3 else ("warn" if len(flags) == 2 else "info"),
+    }
+
+
+def fraud_message(title: str, a: dict) -> str:
+    head = (
+        "🚨 <b>Unusual join pattern</b>" if a["level"] == "high"
+        else "⚠️ <b>Worth a look</b>"
+    )
+    normal = (
+        f"about {a['baseline']:.0f}/hour" if a["baseline"] >= 1
+        else "close to nothing"
+    )
+    body = [
+        f"{head} · {esc(title)}\n",
+        f"<b>{a['n']} accounts joined</b> in the last {FRAUD_WINDOW_MIN} minutes "
+        f"(~{a['per_hour']:.0f}/hour). Normal for this channel is {normal}.\n",
+        "<b>What stands out</b>",
+    ]
+    body += [f"• {f}" for f in a["flags"]]
+
+    if a["level"] == "high":
+        body.append(
+            "\nThat combination is what paid bot traffic looks like. Real audiences "
+            "don't arrive and leave as one block, and they don't share a signup date."
+        )
+    else:
+        body.append(
+            "\nThis might be nothing — a shoutout or a good ad spikes too. But two "
+            "signals together is worth ten minutes of your time."
+        )
+
+    body.append(
+        "\n<b>Check before you change anything</b>\n"
+        "1. Open Telegram Ads → this campaign. Compare impressions to clicks. "
+        "If they're nearly equal (CTR approaching 100%), that's click fraud and "
+        "your budget is being drained right now.\n"
+        "2. Search-keyword placement is hit hardest — bots can clear a daily "
+        "budget there in minutes.\n"
+        "3. If the CTR confirms it, pause the campaign, then add an automatic "
+        "rule that stops any ad whose CTR crosses a sane ceiling."
+    )
+    body.append(
+        "\n<i>If your CTR looks normal, don't kill the campaign — you may just be "
+        "buying cheap, low-intent traffic. Narrow the targeting instead.</i>"
+    )
+    return "\n".join(body)
+
+
+async def fraud_watch_job() -> None:
+    while True:
+        try:
+            async with pool.acquire() as con:
+                chans = await con.fetch("SELECT * FROM channels WHERE active")
+            for c in chans:
+                if not await has_access(c["owner_id"]):
+                    continue
+                if await alerted_recently(c["chat_id"], "fraud", FRAUD_COOLDOWN_H):
+                    continue
+                a = await analyse_burst(c["chat_id"])
+                if not a or a["level"] == "info":
+                    continue
+                await note_alert(c["chat_id"], "fraud")
+                await dm(c["owner_id"], fraud_message(c["title"], a))
+                log.info(
+                    "fraud alert %s: n=%s bounce=%.2f nouser=%.2f cluster=%.2f",
+                    c["chat_id"], a["n"], a["bounced"], a["nouser"], a["cluster"],
+                )
+                await asyncio.sleep(0.2)
+        except Exception as e:
+            log.exception("fraud watch error: %s", e)
+        await asyncio.sleep(600)
 
 
 async def daily_digest_job() -> None:
@@ -1470,6 +1775,8 @@ async def main() -> None:
     asyncio.create_task(countdown_updater())
     asyncio.create_task(daily_digest_job())
     asyncio.create_task(expiry_job())
+    asyncio.create_task(burst_rollup_job())
+    asyncio.create_task(fraud_watch_job())
 
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(
