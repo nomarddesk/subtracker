@@ -995,6 +995,18 @@ def pay_intro() -> str:
 # --- admin ------------------------------------------------------------------
 
 
+@dp.message(Command("whoami"))
+async def cmd_whoami(m: Message):
+    """Anyone can run this — it only reveals the caller's own id, which the
+    Telegram API already hands to any bot they message."""
+    is_admin = m.from_user.id in ADMIN_IDS
+    await m.answer(
+        f"Your Telegram id\n<code>{m.from_user.id}</code>\n\n"
+        f"Admin: {'yes' if is_admin else 'no'}\n"
+        f"ADMIN_IDS currently loaded: {len(ADMIN_IDS)}"
+    )
+
+
 @dp.message(Command("grant"))
 async def cmd_grant(m: Message):
     if m.from_user.id not in ADMIN_IDS:
